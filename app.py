@@ -6,6 +6,8 @@ from flask import Flask, abort, flash, redirect, render_template, request, url_f
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import or_
 
+from services.ai import AIServiceError, ask_ai
+
 db = SQLAlchemy()
 
 APPLICATION_STATUSES = (
@@ -55,11 +57,15 @@ class Application(db.Model):
     date_applied = db.Column(db.Date)
     status = db.Column(db.String(40), default="Interested", nullable=False)
     notes = db.Column(db.Text, default="")
+    next_action = db.Column(db.Text)
+    next_action_date = db.Column(db.Date)
+    next_action_completed_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, nullable=False)
     pathway = db.relationship("Pathway", back_populates="applications")
     persona = db.relationship("Persona", back_populates="applications")
     contacts = db.relationship("Contact", back_populates="application", cascade="all, delete-orphan", lazy="selectin")
+    activities = db.relationship("Activity", back_populates="application", cascade="all, delete-orphan", lazy="selectin")
 
 
 class Contact(db.Model):
@@ -76,6 +82,66 @@ class Contact(db.Model):
     created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, nullable=False)
     application = db.relationship("Application", back_populates="contacts")
+
+
+class Activity(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    application_id = db.Column(db.Integer, db.ForeignKey("application.id"), nullable=False, index=True)
+    contact_id = db.Column(db.Integer, nullable=True)
+    event_type = db.Column(db.String(50), nullable=False, index=True)
+    description = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False, index=True)
+    application = db.relationship("Application", back_populates="activities")
+
+
+def record_activity(application, event_type, description, contact_id=None):
+    db.session.add(Activity(application=application, contact_id=contact_id,
+                            event_type=event_type, description=description))
+
+
+def attention_items(applications, today=None):
+    today = today or date.today()
+    terminal = {"Offer", "Rejected", "Withdrawn", "Closed"}
+    items = []
+    for application in applications:
+        current_action = application.next_action and not application.next_action_completed_at
+        if current_action:
+            due = application.next_action_date
+            rank = 0 if due and due < today else 1 if due == today else 2
+            items.append({"kind": "action", "rank": rank, "application": application,
+                          "text": application.next_action, "due": due})
+        if application.status in {"Interview", "Final Round"} and not current_action:
+            items.append({"kind": "suggestion", "rank": 3, "application": application,
+                          "text": "Interviewing with no next action scheduled. Add a preparation task."})
+        for contact in application.contacts:
+            if contact.outreach_status == "Follow-up Needed":
+                suffix = f" Last outreach was {(today-contact.outreach_date).days} days ago." if contact.outreach_date else ""
+                items.append({"kind": "suggestion", "rank": 4, "application": application,
+                              "text": f"Follow up with {contact.name}.{suffix}"})
+        age = (today - (application.date_applied or application.created_at.date())).days
+        if application.status == "Applied" and age >= 7 and not application.contacts:
+            items.append({"kind": "suggestion", "rank": 5, "application": application,
+                          "text": f"Applied {age} days ago with no outreach contacts. Add a contact."})
+        elif application.status == "Networking" and not application.contacts:
+            items.append({"kind": "suggestion", "rank": 5, "application": application,
+                          "text": "Networking application has no contacts. Add a contact."})
+        stale = (today - application.updated_at.date()).days
+        if application.status not in terminal and stale >= 14:
+            items.append({"kind": "suggestion", "rank": 6, "application": application,
+                          "text": f"No activity for {stale} days. Review this application."})
+    return sorted(items, key=lambda x: (x["rank"], x.get("due") or date.max, x["application"].company.lower()))
+
+
+def tracker_context(limit=30):
+    applications = db.session.scalars(db.select(Application).order_by(Application.updated_at.desc()).limit(limit)).all()
+    lines = []
+    for item in applications:
+        contacts = ", ".join(f"{c.name} ({c.outreach_status})" for c in item.contacts) or "none"
+        lines.append(f"{item.company} — {item.role_title}; status={item.status}; pathway={item.pathway.short_name}; "
+                     f"persona={item.persona.short_name}; next action={item.next_action or 'none'}; "
+                     f"due={item.next_action_date or 'none'}; contacts={contacts}; updated={item.updated_at.date()}")
+    recent = db.session.scalars(db.select(Activity).order_by(Activity.created_at.desc()).limit(10)).all()
+    return "Applications:\n" + "\n".join(lines) + "\nRecent activity:\n" + "\n".join(a.description for a in recent)
 
 
 PERSONA_SEEDS = [
@@ -120,6 +186,8 @@ def populate_application(item):
     item.status = request.form.get("status", "Interested")
     item.pathway_id = request.form.get("pathway_id", type=int)
     item.persona_id = request.form.get("persona_id", type=int)
+    item.next_action = request.form.get("next_action", "").strip() or None
+    item.next_action_date = parse_date(request.form.get("next_action_date"))
     return bool(item.company and item.role_title and item.pathway_id and item.persona_id and item.status in APPLICATION_STATUSES)
 
 
@@ -136,6 +204,30 @@ def create_app(test_config=None):
     db.init_app(app)
 
     @app.get("/")
+    def dashboard():
+        applications = db.session.scalars(db.select(Application).order_by(Application.updated_at.desc())).all()
+        recent = db.session.scalars(db.select(Activity).order_by(Activity.created_at.desc()).limit(10)).all()
+        return render_template("dashboard.html", attention=attention_items(applications), recent=recent,
+                               default_provider=os.environ.get("DEFAULT_AI_PROVIDER", "openai").lower())
+
+    @app.post("/ask")
+    def ask():
+        message = request.form.get("message", "").strip()
+        provider = request.form.get("provider", "openai").lower()
+        if not message:
+            flash("Enter a question first.", "error")
+            return redirect(url_for("dashboard"))
+        try:
+            answer = ask_ai(provider, message, tracker_context())
+            return render_template("dashboard.html", attention=attention_items(db.session.scalars(db.select(Application)).all()),
+                recent=db.session.scalars(db.select(Activity).order_by(Activity.created_at.desc()).limit(10)).all(),
+                default_provider=provider, ai_answer=answer, asked_message=message)
+        except AIServiceError as error:
+            return render_template("dashboard.html", attention=attention_items(db.session.scalars(db.select(Application)).all()),
+                recent=db.session.scalars(db.select(Activity).order_by(Activity.created_at.desc()).limit(10)).all(),
+                default_provider=provider, ai_error=str(error), asked_message=message), 503
+
+    @app.get("/applications")
     def applications():
         query = db.select(Application)
         search = request.args.get("q", "").strip()
@@ -161,8 +253,16 @@ def create_app(test_config=None):
     def application_form(item_id=None):
         item = db.get_or_404(Application, item_id) if item_id else Application()
         if request.method == "POST":
+            is_new, old_status, old_action = item.id is None, item.status, item.next_action
             if populate_application(item):
-                db.session.add(item); db.session.commit()
+                db.session.add(item); db.session.flush()
+                if is_new: record_activity(item, "application_created", f"Created application for {item.role_title}.")
+                elif old_status != item.status: record_activity(item, "status_changed", f"Status changed from {old_status} to {item.status}.")
+                if item.next_action and item.next_action != old_action:
+                    item.next_action_completed_at = None
+                    record_activity(item, "next_action_created" if not old_action else "next_action_updated",
+                                    f"{'Added' if not old_action else 'Updated'} next action: {item.next_action}.")
+                db.session.commit()
                 flash("Application saved.", "success")
                 return redirect(url_for("application_detail", item_id=item.id))
             flash("Company, role, pathway, and persona are required.", "error")
@@ -173,6 +273,15 @@ def create_app(test_config=None):
     @app.get("/applications/<int:item_id>")
     def application_detail(item_id):
         return render_template("application_detail.html", item=db.get_or_404(Application, item_id), outreach_statuses=OUTREACH_STATUSES)
+
+    @app.post("/applications/<int:item_id>/next-action/complete")
+    def next_action_complete(item_id):
+        item = db.get_or_404(Application, item_id)
+        if item.next_action and not item.next_action_completed_at:
+            item.next_action_completed_at = utcnow()
+            record_activity(item, "next_action_completed", f"Completed next action: {item.next_action}.")
+            db.session.commit(); flash("Next action completed.", "success")
+        return redirect(request.referrer or url_for("application_detail", item_id=item_id))
 
     @app.post("/applications/<int:item_id>/delete")
     def application_delete(item_id):
@@ -188,10 +297,12 @@ def create_app(test_config=None):
         if not name or status not in OUTREACH_STATUSES:
             flash("Contact name is required.", "error")
         else:
-            db.session.add(Contact(application=application, name=name, title=request.form.get("title", "").strip(),
+            contact = Contact(application=application, name=name, title=request.form.get("title", "").strip(),
                 organization=request.form.get("organization", "").strip(), email=request.form.get("email", "").strip(),
                 linkedin_url=request.form.get("linkedin_url", "").strip(), outreach_date=parse_date(request.form.get("outreach_date")),
-                outreach_status=status, notes=request.form.get("notes", "").strip()))
+                outreach_status=status, notes=request.form.get("notes", "").strip())
+            db.session.add(contact); db.session.flush()
+            record_activity(application, "contact_added", f"Added {contact.name} as a contact.", contact.id)
             db.session.commit(); flash("Contact added.", "success")
         return redirect(url_for("application_detail", item_id=item_id))
 
@@ -199,11 +310,14 @@ def create_app(test_config=None):
     def contact_edit(contact_id):
         contact = db.get_or_404(Contact, contact_id)
         if request.method == "POST":
+            old_status = contact.outreach_status
             contact.name = request.form.get("name", "").strip(); contact.title = request.form.get("title", "").strip()
             contact.organization = request.form.get("organization", "").strip(); contact.email = request.form.get("email", "").strip()
             contact.linkedin_url = request.form.get("linkedin_url", "").strip(); contact.outreach_date = parse_date(request.form.get("outreach_date"))
             contact.outreach_status = request.form.get("outreach_status", "Not Contacted"); contact.notes = request.form.get("notes", "").strip()
             if contact.name and contact.outreach_status in OUTREACH_STATUSES:
+                if old_status != contact.outreach_status:
+                    record_activity(contact.application, "outreach_updated", f"{contact.name} outreach status changed from {old_status} to {contact.outreach_status}.", contact.id)
                 db.session.commit(); flash("Contact updated.", "success"); return redirect(url_for("application_detail", item_id=contact.application_id))
             flash("Contact name is required.", "error")
         return render_template("contact_form.html", contact=contact, outreach_statuses=OUTREACH_STATUSES)
@@ -211,12 +325,23 @@ def create_app(test_config=None):
     @app.post("/contacts/<int:contact_id>/delete")
     def contact_delete(contact_id):
         contact = db.get_or_404(Contact, contact_id); item_id = contact.application_id
+        record_activity(contact.application, "contact_deleted", f"Deleted contact {contact.name}.")
         db.session.delete(contact); db.session.commit(); flash("Contact deleted.", "success")
         return redirect(url_for("application_detail", item_id=item_id))
 
     @app.get("/contacts")
     def contacts():
         return render_template("contacts.html", contacts=db.session.scalars(db.select(Contact).order_by(Contact.updated_at.desc())).all())
+
+    @app.get("/activity")
+    def activity():
+        query = db.select(Activity)
+        application_id = request.args.get("application", type=int); event_type = request.args.get("event_type", "")
+        if application_id: query = query.where(Activity.application_id == application_id)
+        if event_type: query = query.where(Activity.event_type == event_type)
+        return render_template("activity.html", activities=db.session.scalars(query.order_by(Activity.created_at.desc()).limit(100)).all(),
+            applications=db.session.scalars(db.select(Application).order_by(Application.company)).all(),
+            event_types=db.session.scalars(db.select(Activity.event_type).distinct().order_by(Activity.event_type)).all())
 
     def reference_view(model, template, kind):
         items = db.session.scalars(db.select(model).order_by(model.active.desc(), model.name)).all()
