@@ -1,0 +1,16 @@
+{% extends 'base.html' %}{% block title %}Applications{% endblock %}{% block content %}
+<div class="page-heading"><div><h1>Applications</h1><p>Your active job pipeline and outreach.</p></div><a class="button primary" href="{{ url_for('application_form') }}">+ New application</a></div>
+<section class="summary" aria-label="Pipeline summary">
+  <div><strong>{{ counts.all }}</strong><span>Applications</span></div><div><strong>{{ counts.interview }}</strong><span>Interviewing</span></div><div><strong>{{ counts.networking }}</strong><span>Networking</span></div><div><strong>{{ counts.offer }}</strong><span>Offers</span></div>
+</section>
+<form class="filters" method="get"><input name="q" value="{{ request.args.get('q','') }}" placeholder="Search company or role" aria-label="Search">
+  <select name="status" aria-label="Status"><option value="">All statuses</option>{% for value in statuses %}<option {% if request.args.get('status') == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select>
+  <select name="pathway" aria-label="Pathway"><option value="">All pathways</option>{% for p in pathways %}<option value="{{ p.id }}" {% if request.args.get('pathway')|int == p.id %}selected{% endif %}>{{ p.short_name }}</option>{% endfor %}</select>
+  <select name="persona" aria-label="Persona"><option value="">All personas</option>{% for p in personas %}<option value="{{ p.id }}" {% if request.args.get('persona')|int == p.id %}selected{% endif %}>{{ p.short_name }}</option>{% endfor %}</select>
+  <button class="button">Filter</button>{% if request.query_string %}<a href="{{ url_for('applications') }}">Clear</a>{% endif %}
+</form>
+<div class="table-wrap"><table><thead><tr><th>Company / Role</th><th>Pathway</th><th>Persona</th><th>Status</th><th>Applied</th><th>Contacts</th><th>Last activity</th></tr></thead><tbody>
+{% for item in applications %}<tr><td><a class="primary-link" href="{{ url_for('application_detail', item_id=item.id) }}">{{ item.company }}</a><span class="subline">{{ item.role_title }}</span></td>
+<td><span class="label" style="--label-color:{{ item.pathway.color }}">{{ item.pathway.short_name }}</span></td><td><span class="label" style="--label-color:{{ item.persona.color }}">{{ item.persona.short_name }}</span></td><td><span class="status status-{{ item.status|lower|replace(' ','-') }}">{{ item.status }}</span></td><td>{{ item.date_applied.strftime('%b %-d, %Y') if item.date_applied else '—' }}</td><td>{{ item.contacts|length }}</td><td>{{ item.updated_at.strftime('%b %-d') }}</td></tr>
+{% else %}<tr><td colspan="7" class="empty">No applications match. <a href="{{ url_for('application_form') }}">Create the first one.</a></td></tr>{% endfor %}</tbody></table></div>
+{% endblock %}
