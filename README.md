@@ -95,3 +95,45 @@ systemctl restart job-tracker
 ```
 
 Keep `instance/` persistent across Git pulls, Gunicorn restarts, and reboots. The existing environment variables remain unchanged: `OPENAI_API_KEY`, `GEMINI_API_KEY`, `DEFAULT_AI_PROVIDER`, `OPENAI_MODEL`, `GEMINI_MODEL`, and `SECRET_KEY`. AI keys stay on the Flask backend. Gunicorn remains supported with `gunicorn --workers 2 --bind 127.0.0.1:8000 app:app`.
+
+## Job Tracker V3.1 activity privacy
+
+V3.1 keeps `/activity` as the private, filterable operational history while removing cover-letter generation and PDF-edit events from normal Activity feeds, Application timelines, Home, and generic Ask Anything context. Existing rows are retained; this is an application-level visibility change and requires no migration. Imported and manually entered Applications now use the same user-facing creation wording based on the final saved role title.
+
+`/public` is a standalone, read-only **Public Activity** page for sharing selected progress. Its explicit public allowlist is `application_created`, `application_imported`, `status_changed`, and `next_action_completed`; all unknown and future event types remain private until deliberately reviewed and added. Public descriptions are sanitized: creation uses current Application data, and next-action completion never includes the task text. The page does not expose contacts, outreach, documents, notes, postings, or links to private Application pages. Its `noindex,nofollow` directive discourages ordinary indexing but is not access control.
+
+### Nginx Basic Authentication exemption
+
+Flask routing alone does not bypass production Basic Authentication. Exempt **only** the exact public URL before the protected general location:
+
+```nginx
+location = /public {
+    auth_basic off;
+
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+location / {
+    auth_basic "Job Tracker";
+    auth_basic_user_file /etc/nginx/.job-tracker-htpasswd;
+
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+The public template contains its small stylesheet inline, so no static asset exemption is needed. Validate and then reload Nginx:
+
+```bash
+nginx -t
+systemctl reload nginx
+```
+
+> **Warning:** Do not remove Basic Authentication from the general `location /` block. Only `/public` and any strictly necessary public presentation assets should be exempted.
