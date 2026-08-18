@@ -66,3 +66,32 @@ systemctl restart job-tracker
 ```
 
 Gunicorn remains supported with `gunicorn --workers 2 --bind 127.0.0.1:8000 app:app`. Preserve the `instance/` directory across deployments and never commit databases, `.env` files, logs, or virtual environments.
+
+## Job Tracker V3
+
+V3 adds a confirmation-first posting intake, a unified Files library, and versioned PDF cover letters while retaining the V2 operational workflow. Paste a posting on Home, select OpenAI or Gemini, review every extracted field and suggested Pathway/Persona, optionally set the existing Next Action and select cover-letter source Documents, then explicitly confirm. Extraction stores a server-side draft and cannot create an Application. The confirmed Application retains the raw posting.
+
+### Files, AI context, and cover letters
+
+`/files` accepts PDF, DOCX, TXT, and Markdown uploads up to 10 MB. Binaries use UUID filenames under `instance/files/uploads`; generated PDFs live under `instance/files/generated`. SQLite contains metadata and extracted text, not binaries. PDFs use embedded-text extraction only (no OCR). Ask Anything includes only Documents explicitly checked under **@ Add file context**, with per-document and total context limits.
+
+Generated letters use the posting, Application details, explicitly selected source Documents, and optional instructions. They are normal Documents linked to the Application, retain normalized source provenance, and are never overwritten by a later version. Generated text can be edited and its PDF rebuilt without AI. Configure the optional sender header at `/profile`. Provider failures do not remove an already-confirmed Application.
+
+### Safe V3 production upgrade and backup
+
+Back up both persistent state types before pulling. The migration only adds a nullable Application column and creates missing V3 tables/indexes; it is safe to rerun and never deletes V1/V2 rows.
+
+```bash
+cd /opt/job-tracker
+mkdir -p /opt/backups
+cp instance/job_tracker.db instance/job_tracker.pre-v3.db
+tar -czf /opt/backups/job-tracker-files-pre-v3.tar.gz instance/files/ 2>/dev/null || true
+git pull origin main
+source .venv/bin/activate
+pip install -r requirements.txt
+python migrations/migrate_v3.py instance/job_tracker.db
+python -m unittest discover -s tests -v
+systemctl restart job-tracker
+```
+
+Keep `instance/` persistent across Git pulls, Gunicorn restarts, and reboots. The existing environment variables remain unchanged: `OPENAI_API_KEY`, `GEMINI_API_KEY`, `DEFAULT_AI_PROVIDER`, `OPENAI_MODEL`, `GEMINI_MODEL`, and `SECRET_KEY`. AI keys stay on the Flask backend. Gunicorn remains supported with `gunicorn --workers 2 --bind 127.0.0.1:8000 app:app`.

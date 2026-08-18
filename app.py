@@ -1,12 +1,15 @@
+import json
 import os
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from flask import Flask, abort, flash, redirect, render_template, request, url_for
+from flask import Flask, abort, flash, redirect, render_template, request, send_file, url_for
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import or_
 
-from services.ai import AIServiceError, ask_ai
+from services.ai import AIServiceError, ask_ai, extract_application_from_posting, generate_cover_letter
+from services.documents import extract_text, render_cover_letter_pdf
 
 db = SQLAlchemy()
 
@@ -57,6 +60,7 @@ class Application(db.Model):
     date_applied = db.Column(db.Date)
     status = db.Column(db.String(40), default="Interested", nullable=False)
     notes = db.Column(db.Text, default="")
+    job_posting_text = db.Column(db.Text)
     next_action = db.Column(db.Text)
     next_action_date = db.Column(db.Date)
     next_action_completed_at = db.Column(db.DateTime)
@@ -66,6 +70,55 @@ class Application(db.Model):
     persona = db.relationship("Persona", back_populates="applications")
     contacts = db.relationship("Contact", back_populates="application", cascade="all, delete-orphan", lazy="selectin")
     activities = db.relationship("Activity", back_populates="application", cascade="all, delete-orphan", lazy="selectin")
+    documents = db.relationship("Document", back_populates="application", cascade="all, delete-orphan", lazy="selectin")
+
+
+class ApplicationImportDraft(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    raw_job_posting = db.Column(db.Text, nullable=False)
+    draft_data = db.Column(db.Text, nullable=False, default="{}")
+    provider = db.Column(db.String(20), nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+    confirmed_at = db.Column(db.DateTime)
+    application_id = db.Column(db.Integer, db.ForeignKey("application.id"))
+
+
+document_source = db.Table("document_source",
+    db.Column("generated_document_id", db.Integer, db.ForeignKey("document.id", ondelete="CASCADE"), primary_key=True),
+    db.Column("source_document_id", db.Integer, db.ForeignKey("document.id", ondelete="CASCADE"), primary_key=True))
+
+
+class Document(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    document_type = db.Column(db.String(30), nullable=False, index=True)
+    source_type = db.Column(db.String(20), nullable=False)
+    application_id = db.Column(db.Integer, db.ForeignKey("application.id"), index=True)
+    persona_id = db.Column(db.Integer, db.ForeignKey("persona.id"))
+    original_filename = db.Column(db.String(255))
+    stored_filename = db.Column(db.String(80))
+    mime_type = db.Column(db.String(100))
+    size_bytes = db.Column(db.Integer)
+    text_content = db.Column(db.Text)
+    notes = db.Column(db.Text, default="")
+    provider = db.Column(db.String(20))
+    model_name = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+    application = db.relationship("Application", back_populates="documents")
+    persona = db.relationship("Persona")
+    sources = db.relationship("Document", secondary=document_source,
+        primaryjoin=id == document_source.c.generated_document_id,
+        secondaryjoin=id == document_source.c.source_document_id)
+
+
+class Profile(db.Model):
+    id = db.Column(db.Integer, primary_key=True, default=1)
+    full_name = db.Column(db.String(160), default="")
+    location = db.Column(db.String(160), default="")
+    email = db.Column(db.String(254), default="")
+    phone = db.Column(db.String(80), default="")
+    linkedin_url = db.Column(db.String(500), default="")
 
 
 class Contact(db.Model):
@@ -198,17 +251,39 @@ def create_app(test_config=None):
         SECRET_KEY=os.environ.get("SECRET_KEY", "dev-only-change-me"),
         SQLALCHEMY_DATABASE_URI="sqlite:///job_tracker.db",
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
+        MAX_CONTENT_LENGTH=10 * 1024 * 1024,
     )
     if test_config:
         app.config.update(test_config)
     db.init_app(app)
+    files_root = Path(app.instance_path) / "files"
+    upload_root, generated_root = files_root / "uploads", files_root / "generated"
+    upload_root.mkdir(parents=True, exist_ok=True); generated_root.mkdir(parents=True, exist_ok=True)
+
+    def library_documents():
+        return db.session.scalars(db.select(Document).order_by(Document.created_at.desc())).all()
+
+    def generate_document(application, provider, source_ids, instructions=""):
+        sources = db.session.scalars(db.select(Document).where(Document.id.in_(source_ids))).all() if source_ids else []
+        letter = generate_cover_letter(provider, application, application.job_posting_text or "", sources, instructions)
+        stored = f"{uuid.uuid4().hex}.pdf"
+        profile = db.session.get(Profile, 1) or Profile(id=1)
+        render_cover_letter_pdf(generated_root / stored, letter, application, profile)
+        document = Document(title=f"Cover Letter — {application.company} — {application.role_title}",
+            document_type="cover_letter", source_type="generated", application=application,
+            stored_filename=stored, mime_type="application/pdf", text_content=letter,
+            provider=provider, model_name=os.environ.get(f"{provider.upper()}_MODEL"), sources=sources)
+        db.session.add(document); db.session.flush()
+        record_activity(application, "cover_letter_generated", "Generated cover letter.")
+        db.session.commit()
+        return document
 
     @app.get("/")
     def dashboard():
         applications = db.session.scalars(db.select(Application).order_by(Application.updated_at.desc())).all()
         recent = db.session.scalars(db.select(Activity).order_by(Activity.created_at.desc()).limit(10)).all()
         return render_template("dashboard.html", attention=attention_items(applications), recent=recent,
-                               default_provider=os.environ.get("DEFAULT_AI_PROVIDER", "openai").lower())
+                               default_provider=os.environ.get("DEFAULT_AI_PROVIDER", "openai").lower(), documents=library_documents())
 
     @app.post("/ask")
     def ask():
@@ -218,14 +293,69 @@ def create_app(test_config=None):
             flash("Enter a question first.", "error")
             return redirect(url_for("dashboard"))
         try:
-            answer = ask_ai(provider, message, tracker_context())
+            ids = list(dict.fromkeys(request.form.getlist("document_ids", type=int)))[:10]
+            documents = db.session.scalars(db.select(Document).where(Document.id.in_(ids))).all() if ids else []
+            extra, total = [], 0
+            for document in documents:
+                content = (document.text_content or "")[:12000]; remaining = 30000 - total
+                if remaining <= 0: break
+                content = content[:remaining]; total += len(content)
+                extra.append(f"Selected document: {document.title}\n{content}" + ("\n[truncated]" if len(document.text_content or "") > len(content) else ""))
+            answer = ask_ai(provider, message, tracker_context() + ("\n\n" + "\n\n".join(extra) if extra else ""))
             return render_template("dashboard.html", attention=attention_items(db.session.scalars(db.select(Application)).all()),
                 recent=db.session.scalars(db.select(Activity).order_by(Activity.created_at.desc()).limit(10)).all(),
-                default_provider=provider, ai_answer=answer, asked_message=message)
+                default_provider=provider, ai_answer=answer, asked_message=message, documents=library_documents(), selected_document_ids=ids)
         except AIServiceError as error:
             return render_template("dashboard.html", attention=attention_items(db.session.scalars(db.select(Application)).all()),
                 recent=db.session.scalars(db.select(Activity).order_by(Activity.created_at.desc()).limit(10)).all(),
-                default_provider=provider, ai_error=str(error), asked_message=message), 503
+                default_provider=provider, ai_error=str(error), asked_message=message, documents=library_documents()), 503
+
+    @app.post("/applications/import")
+    def application_import():
+        posting = request.form.get("posting_text", "").strip(); provider = request.form.get("provider", "openai").lower()
+        if not posting:
+            flash("Paste a job posting first.", "error"); return redirect(url_for("dashboard"))
+        pathways = db.session.scalars(db.select(Pathway).where(Pathway.active.is_(True))).all()
+        personas = db.session.scalars(db.select(Persona).where(Persona.active.is_(True))).all()
+        try: data = extract_application_from_posting(provider, posting, pathways, personas)
+        except AIServiceError as error:
+            flash(str(error), "error"); return redirect(url_for("dashboard"))
+        draft = ApplicationImportDraft(raw_job_posting=posting, draft_data=json.dumps(data), provider=provider)
+        db.session.add(draft); db.session.commit()
+        return redirect(url_for("application_import_review", draft_id=draft.id))
+
+    @app.get("/applications/import/<int:draft_id>/review")
+    def application_import_review(draft_id):
+        draft = db.get_or_404(ApplicationImportDraft, draft_id)
+        if draft.confirmed_at and draft.application_id: return redirect(url_for("application_detail", item_id=draft.application_id))
+        data = json.loads(draft.draft_data); duplicate = None
+        if data.get("company") and data.get("role_title"):
+            duplicate = db.session.scalar(db.select(Application).where(
+                db.func.lower(Application.company) == data["company"].lower(),
+                db.func.lower(Application.role_title) == data["role_title"].lower()))
+        return render_template("application_import_review.html", draft=draft, data=data, duplicate=duplicate,
+            statuses=APPLICATION_STATUSES, pathways=db.session.scalars(db.select(Pathway).order_by(Pathway.name)).all(),
+            personas=db.session.scalars(db.select(Persona).order_by(Persona.name)).all(), documents=library_documents())
+
+    @app.post("/applications/import/<int:draft_id>/confirm")
+    def application_import_confirm(draft_id):
+        draft = db.get_or_404(ApplicationImportDraft, draft_id)
+        if draft.confirmed_at and draft.application_id: return redirect(url_for("application_detail", item_id=draft.application_id))
+        item = Application(job_posting_text=draft.raw_job_posting)
+        if not populate_application(item):
+            flash("Company, role, pathway, and persona are required.", "error"); return redirect(url_for("application_import_review", draft_id=draft.id))
+        # IDs are accepted only when they resolve to existing reference rows.
+        if not db.session.get(Pathway, item.pathway_id) or not db.session.get(Persona, item.persona_id):
+            flash("Choose an existing pathway and persona.", "error"); return redirect(url_for("application_import_review", draft_id=draft.id))
+        db.session.add(item); db.session.flush(); draft.application_id = item.id; draft.confirmed_at = utcnow()
+        record_activity(item, "application_imported", "Created application from pasted job posting.")
+        db.session.commit()
+        if request.form.get("generate_cover_letter"):
+            try: generate_document(item, draft.provider, request.form.getlist("source_document_ids", type=int), request.form.get("cover_letter_instructions", ""))
+            except (AIServiceError, OSError, ValueError):
+                db.session.rollback(); flash("Application created successfully. Cover letter generation failed. You can retry from the Application page.", "error")
+        else: flash("Application created successfully.", "success")
+        return redirect(url_for("application_detail", item_id=item.id))
 
     @app.get("/applications")
     def applications():
@@ -272,7 +402,96 @@ def create_app(test_config=None):
 
     @app.get("/applications/<int:item_id>")
     def application_detail(item_id):
-        return render_template("application_detail.html", item=db.get_or_404(Application, item_id), outreach_statuses=OUTREACH_STATUSES)
+        return render_template("application_detail.html", item=db.get_or_404(Application, item_id),
+            outreach_statuses=OUTREACH_STATUSES, documents=library_documents())
+
+    @app.post("/applications/<int:item_id>/cover-letter")
+    def application_cover_letter(item_id):
+        item = db.get_or_404(Application, item_id)
+        try:
+            generate_document(item, request.form.get("provider", "openai"),
+                request.form.getlist("source_document_ids", type=int), request.form.get("instructions", ""))
+            flash("Cover letter generated.", "success")
+        except (AIServiceError, OSError, ValueError) as error:
+            db.session.rollback(); flash(f"Cover letter generation failed: {error}", "error")
+        return redirect(url_for("application_detail", item_id=item.id))
+
+    @app.get("/files")
+    def files():
+        kind = request.args.get("type", "")
+        query = db.select(Document)
+        if kind in {"cv", "cover_letter", "bio", "writing_sample", "other"}: query = query.where(Document.document_type == kind)
+        return render_template("files.html", documents=db.session.scalars(query.order_by(Document.created_at.desc())).all(), kind=kind)
+
+    @app.post("/files/upload")
+    def file_upload():
+        uploaded = request.files.get("file"); kind = request.form.get("document_type", "other")
+        allowed = {".pdf": "application/pdf", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                   ".txt": "text/plain", ".md": "text/markdown"}
+        suffix = Path(uploaded.filename or "").suffix.lower() if uploaded else ""
+        if not uploaded or suffix not in allowed or kind not in {"cv", "cover_letter", "bio", "writing_sample", "other"}:
+            flash("Upload a supported PDF, DOCX, TXT, or MD file.", "error"); return redirect(url_for("files"))
+        # Flask enforces MAX_CONTENT_LENGTH; this also handles clients without Content-Length.
+        payload = uploaded.read(10 * 1024 * 1024 + 1)
+        if len(payload) > 10 * 1024 * 1024:
+            flash("Files must be 10 MB or smaller.", "error"); return redirect(url_for("files"))
+        stored = f"{uuid.uuid4().hex}{suffix}"; path = upload_root / stored; path.write_bytes(payload)
+        try: text_content = extract_text(path, suffix)
+        except (OSError, ValueError):
+            path.unlink(missing_ok=True); flash("The file could not be read.", "error"); return redirect(url_for("files"))
+        document = Document(title=request.form.get("title", "").strip() or Path(uploaded.filename).stem,
+            document_type=kind, source_type="uploaded", original_filename=Path(uploaded.filename).name,
+            stored_filename=stored, mime_type=allowed[suffix], size_bytes=len(payload), text_content=text_content,
+            notes=request.form.get("notes", "").strip())
+        db.session.add(document); db.session.commit(); flash("File uploaded.", "success")
+        return redirect(url_for("file_detail", document_id=document.id))
+
+    @app.route("/files/<int:document_id>", methods=("GET", "POST"))
+    def file_detail(document_id):
+        document = db.get_or_404(Document, document_id)
+        if request.method == "POST":
+            document.title = request.form.get("title", "").strip(); kind = request.form.get("document_type", document.document_type)
+            if not document.title or kind not in {"cv", "cover_letter", "bio", "writing_sample", "other"}:
+                flash("Title and a valid type are required.", "error")
+            else:
+                document.document_type = kind; document.notes = request.form.get("notes", "").strip()
+                if document.source_type == "generated":
+                    document.text_content = request.form.get("text_content", "").strip()
+                    render_cover_letter_pdf(generated_root / document.stored_filename, document.text_content, document.application, db.session.get(Profile, 1) or Profile())
+                    record_activity(document.application, "cover_letter_updated", "Updated cover letter PDF.")
+                db.session.commit(); flash("Document updated.", "success")
+                return redirect(url_for("file_detail", document_id=document.id))
+        return render_template("file_detail.html", document=document)
+
+    def document_path(document):
+        root = generated_root if document.source_type == "generated" else upload_root
+        candidate = root / (document.stored_filename or "")
+        if not document.stored_filename or candidate.parent != root: abort(404)
+        return candidate
+
+    @app.get("/files/<int:document_id>/download")
+    def file_download(document_id):
+        document = db.get_or_404(Document, document_id); path = document_path(document)
+        if not path.is_file(): abort(404)
+        return send_file(path, mimetype=document.mime_type, as_attachment=True,
+            download_name=document.original_filename or f"{document.title}.pdf")
+
+    @app.post("/files/<int:document_id>/delete")
+    def file_delete(document_id):
+        document = db.get_or_404(Document, document_id); path = document_path(document)
+        db.session.delete(document); db.session.commit(); path.unlink(missing_ok=True)
+        flash("Document deleted.", "success"); return redirect(url_for("files"))
+
+    @app.route("/profile", methods=("GET", "POST"))
+    def profile():
+        item = db.session.get(Profile, 1) or Profile(id=1)
+        if request.method == "POST":
+            for field in ("full_name", "location", "email", "phone", "linkedin_url"):
+                setattr(item, field, request.form.get(field, "").strip())
+            if not item.full_name: flash("Name is required.", "error")
+            else:
+                db.session.add(item); db.session.commit(); flash("Profile saved.", "success"); return redirect(url_for("files"))
+        return render_template("profile.html", item=item)
 
     @app.post("/applications/<int:item_id>/next-action/complete")
     def next_action_complete(item_id):
