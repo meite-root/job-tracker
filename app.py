@@ -21,6 +21,10 @@ OUTREACH_STATUSES = (
     "Not Contacted", "Outreach Sent", "Connected", "Replied", "Follow-up Needed",
     "Conversation", "No Response",
 )
+HIDDEN_ACTIVITY_EVENT_TYPES = frozenset({"cover_letter_generated", "cover_letter_updated"})
+PUBLIC_ACTIVITY_EVENT_TYPES = frozenset({
+    "application_created", "application_imported", "status_changed", "next_action_completed",
+})
 
 
 def utcnow():
@@ -152,6 +156,27 @@ def record_activity(application, event_type, description, contact_id=None):
                             event_type=event_type, description=description))
 
 
+def visible_activity_query():
+    """Return the shared internal Activity feed policy."""
+    return db.select(Activity).where(Activity.event_type.not_in(HIDDEN_ACTIVITY_EVENT_TYPES))
+
+
+def public_activity_query():
+    """Return only events deliberately approved for public display."""
+    return db.select(Activity).where(Activity.event_type.in_(PUBLIC_ACTIVITY_EVENT_TYPES))
+
+
+def public_activity_description(activity):
+    """Build public copy without exposing operational descriptions by default."""
+    if activity.event_type in {"application_created", "application_imported"}:
+        return f"Created application for {activity.application.role_title}."
+    if activity.event_type == "next_action_completed":
+        return "Completed a next action."
+    if activity.event_type == "status_changed":
+        return activity.description
+    raise ValueError("Activity event type is not public")
+
+
 def attention_items(applications, today=None):
     today = today or date.today()
     terminal = {"Offer", "Rejected", "Withdrawn", "Closed"}
@@ -193,7 +218,7 @@ def tracker_context(limit=30):
         lines.append(f"{item.company} — {item.role_title}; status={item.status}; pathway={item.pathway.short_name}; "
                      f"persona={item.persona.short_name}; next action={item.next_action or 'none'}; "
                      f"due={item.next_action_date or 'none'}; contacts={contacts}; updated={item.updated_at.date()}")
-    recent = db.session.scalars(db.select(Activity).order_by(Activity.created_at.desc()).limit(10)).all()
+    recent = db.session.scalars(visible_activity_query().order_by(Activity.created_at.desc()).limit(10)).all()
     return "Applications:\n" + "\n".join(lines) + "\nRecent activity:\n" + "\n".join(a.description for a in recent)
 
 
@@ -274,14 +299,13 @@ def create_app(test_config=None):
             stored_filename=stored, mime_type="application/pdf", text_content=letter,
             provider=provider, model_name=os.environ.get(f"{provider.upper()}_MODEL"), sources=sources)
         db.session.add(document); db.session.flush()
-        record_activity(application, "cover_letter_generated", "Generated cover letter.")
         db.session.commit()
         return document
 
     @app.get("/")
     def dashboard():
         applications = db.session.scalars(db.select(Application).order_by(Application.updated_at.desc())).all()
-        recent = db.session.scalars(db.select(Activity).order_by(Activity.created_at.desc()).limit(10)).all()
+        recent = db.session.scalars(visible_activity_query().order_by(Activity.created_at.desc()).limit(10)).all()
         return render_template("dashboard.html", attention=attention_items(applications), recent=recent,
                                default_provider=os.environ.get("DEFAULT_AI_PROVIDER", "openai").lower(), documents=library_documents())
 
@@ -303,11 +327,11 @@ def create_app(test_config=None):
                 extra.append(f"Selected document: {document.title}\n{content}" + ("\n[truncated]" if len(document.text_content or "") > len(content) else ""))
             answer = ask_ai(provider, message, tracker_context() + ("\n\n" + "\n\n".join(extra) if extra else ""))
             return render_template("dashboard.html", attention=attention_items(db.session.scalars(db.select(Application)).all()),
-                recent=db.session.scalars(db.select(Activity).order_by(Activity.created_at.desc()).limit(10)).all(),
+                recent=db.session.scalars(visible_activity_query().order_by(Activity.created_at.desc()).limit(10)).all(),
                 default_provider=provider, ai_answer=answer, asked_message=message, documents=library_documents(), selected_document_ids=ids)
         except AIServiceError as error:
             return render_template("dashboard.html", attention=attention_items(db.session.scalars(db.select(Application)).all()),
-                recent=db.session.scalars(db.select(Activity).order_by(Activity.created_at.desc()).limit(10)).all(),
+                recent=db.session.scalars(visible_activity_query().order_by(Activity.created_at.desc()).limit(10)).all(),
                 default_provider=provider, ai_error=str(error), asked_message=message, documents=library_documents()), 503
 
     @app.post("/applications/import")
@@ -348,7 +372,7 @@ def create_app(test_config=None):
         if not db.session.get(Pathway, item.pathway_id) or not db.session.get(Persona, item.persona_id):
             flash("Choose an existing pathway and persona.", "error"); return redirect(url_for("application_import_review", draft_id=draft.id))
         db.session.add(item); db.session.flush(); draft.application_id = item.id; draft.confirmed_at = utcnow()
-        record_activity(item, "application_imported", "Created application from pasted job posting.")
+        record_activity(item, "application_imported", f"Created application for {item.role_title}.")
         db.session.commit()
         if request.form.get("generate_cover_letter"):
             try: generate_document(item, draft.provider, request.form.getlist("source_document_ids", type=int), request.form.get("cover_letter_instructions", ""))
@@ -402,7 +426,10 @@ def create_app(test_config=None):
 
     @app.get("/applications/<int:item_id>")
     def application_detail(item_id):
-        return render_template("application_detail.html", item=db.get_or_404(Application, item_id),
+        item = db.get_or_404(Application, item_id)
+        activities = db.session.scalars(visible_activity_query().where(
+            Activity.application_id == item.id).order_by(Activity.created_at.desc()).limit(8)).all()
+        return render_template("application_detail.html", item=item, activities=activities,
             outreach_statuses=OUTREACH_STATUSES, documents=library_documents())
 
     @app.post("/applications/<int:item_id>/cover-letter")
@@ -458,7 +485,6 @@ def create_app(test_config=None):
                 if document.source_type == "generated":
                     document.text_content = request.form.get("text_content", "").strip()
                     render_cover_letter_pdf(generated_root / document.stored_filename, document.text_content, document.application, db.session.get(Profile, 1) or Profile())
-                    record_activity(document.application, "cover_letter_updated", "Updated cover letter PDF.")
                 db.session.commit(); flash("Document updated.", "success")
                 return redirect(url_for("file_detail", document_id=document.id))
         return render_template("file_detail.html", document=document)
@@ -554,13 +580,25 @@ def create_app(test_config=None):
 
     @app.get("/activity")
     def activity():
-        query = db.select(Activity)
+        query = visible_activity_query()
         application_id = request.args.get("application", type=int); event_type = request.args.get("event_type", "")
         if application_id: query = query.where(Activity.application_id == application_id)
         if event_type: query = query.where(Activity.event_type == event_type)
         return render_template("activity.html", activities=db.session.scalars(query.order_by(Activity.created_at.desc()).limit(100)).all(),
             applications=db.session.scalars(db.select(Application).order_by(Application.company)).all(),
-            event_types=db.session.scalars(db.select(Activity.event_type).distinct().order_by(Activity.event_type)).all())
+            event_types=db.session.scalars(db.select(Activity.event_type).where(
+                Activity.event_type.not_in(HIDDEN_ACTIVITY_EVENT_TYPES)).distinct().order_by(Activity.event_type)).all())
+
+    @app.get("/public")
+    def public_activity():
+        activities = db.session.scalars(public_activity_query().order_by(
+            Activity.created_at.desc()).limit(100)).all()
+        public_events = [
+            {"created_at": event.created_at, "company": event.application.company,
+             "description": public_activity_description(event), "event_type": event.event_type}
+            for event in activities
+        ]
+        return render_template("public_activity.html", activities=public_events)
 
     def reference_view(model, template, kind):
         items = db.session.scalars(db.select(model).order_by(model.active.desc(), model.name)).all()
